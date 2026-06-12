@@ -108,6 +108,19 @@ local function getBadgeIcon(name, size)
     return icon or nil
 end
 
+-- Resolve the HOME folder across KOReader versions:
+-- filemanagerutil.getHomeFolder() only exists in newer versions (> v2026.03).
+local function getHomeFolder()
+    if filemanagerutil.getHomeFolder then
+        return filemanagerutil.getHomeFolder()
+    end
+    local home = G_reader_settings and G_reader_settings:readSetting("home_dir")
+    if home then return home end
+    if filemanagerutil.getDefaultDir then
+        return filemanagerutil.getDefaultDir()
+    end
+end
+
 -- Build a synthetic file-browser item for a pinned file that physically lives
 -- elsewhere, so it can be shown as a shortcut in the HOME folder. The item
 -- points at the real path, so it renders the real cover/name and opens the
@@ -124,16 +137,10 @@ end
 -- Move pinned entries to the top of the file browser listing:
 -- "../" first, then pinned folders, then pinned books, then HOME shortcuts to
 -- pinned books that live elsewhere, then everything else in its usual order.
-local orig_genItemTableFromPath = FileChooser.genItemTableFromPath
-FileChooser.genItemTableFromPath = function(self, path)
-    local item_table = orig_genItemTableFromPath(self, path)
-    if self.name ~= "filemanager" then
-        return item_table
-    end
-
+local function processItemTable(self, path, item_table)
     -- Build HOME shortcuts for pinned books that are not already in HOME
     local shortcuts = {}
-    local home = ffiUtil.realpath(filemanagerutil.getHomeFolder())
+    local home = ffiUtil.realpath(getHomeFolder())
     if home and ffiUtil.realpath(path) == home and not FileChooser.show_flat_view then
         local collate = self:getCollate()
         for _, realpath in ipairs(pins.files) do
@@ -189,15 +196,27 @@ FileChooser.genItemTableFromPath = function(self, path)
     return reordered
 end
 
+-- pcall-protected wrapper: if anything in our processing breaks (e.g. on an
+-- untested KOReader version), fall back to the unmodified listing instead of
+-- taking the file browser down with us.
+local orig_genItemTableFromPath = FileChooser.genItemTableFromPath
+FileChooser.genItemTableFromPath = function(self, path)
+    local item_table = orig_genItemTableFromPath(self, path)
+    if self.name ~= "filemanager" then
+        return item_table
+    end
+    local ok, result = pcall(processItemTable, self, path, item_table)
+    if not ok then
+        logger.warn("stickabookontop: failed to process item table:", result)
+        return item_table
+    end
+    return result or item_table
+end
+
 -- Draw a corner badge on pinned entries (pushpin, top-left) and on HOME
 -- shortcuts (open-in-new, top-right) in CoverBrowser's mosaic/list modes.
-local orig_paintTo = FileChooser.paintTo
-FileChooser.paintTo = function(self, bb, x, y)
-    orig_paintTo(self, bb, x, y)
+local function paintBadges(self, bb)
     local mode = self.display_mode_type
-    if self.name ~= "filemanager" or not mode then
-        return
-    end
     local function paintBadge(w, icon_name, corner)
         -- anchor rectangle: the cover frame in mosaic, the whole row in list
         local ax, ay, aw = w.dimen.x, w.dimen.y, w.dimen.w
@@ -234,6 +253,18 @@ FileChooser.paintTo = function(self, bb, x, y)
         end
     end
     walk(self.item_group)
+end
+
+local orig_paintTo = FileChooser.paintTo
+FileChooser.paintTo = function(self, bb, x, y)
+    orig_paintTo(self, bb, x, y)
+    if self.name ~= "filemanager" or not self.display_mode_type then
+        return
+    end
+    local ok, err = pcall(paintBadges, self, bb)
+    if not ok then
+        logger.warn("stickabookontop: failed to paint badges:", err)
+    end
 end
 
 local function refreshFileManager()
