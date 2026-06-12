@@ -7,6 +7,13 @@ top of their folder listing and marked with a pushpin at their top-left
 corner: drawn over the cover in CoverBrowser's mosaic/list display modes,
 shown as a glyph before the name in the classic display mode.
 
+In addition, every pinned book that does not already live in the HOME folder
+gets a "shortcut" entry at the top of the HOME folder. The shortcut looks
+just like the book (same cover, name, status) and opens the real file; the
+real file stays where it is and stays pinned in its own folder. Shortcuts are
+marked with an "open in new" badge at their top-RIGHT corner (a glyph before
+the name in classic mode) to tell them apart from real entries.
+
 Pins are stored in settings/stick_a_book_on_top.lua and are shared by all
 FileManager instances; this module therefore patches the FileChooser and
 FileManager classes once, at plugin load time, the same way CoverBrowser
@@ -21,11 +28,15 @@ local ImageWidget = require("ui/widget/imagewidget")
 local LuaSettings = require("luasettings")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local ffiUtil = require("ffi/util")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 
--- Thumbtack glyph from nerdfonts/symbols.ttf, always among the UI font fallbacks
-local PIN_GLYPH = "\u{F08D}"
+-- Glyphs from nerdfonts/symbols.ttf, always among the UI font fallbacks
+local PIN_GLYPH = "\u{F08D}"      -- thumbtack
+local SHORTCUT_GLYPH = "\u{F08E}" -- external-link / open-in-new
 
 local KIND_PROPS = {
     files   = { mode = "file",      max = 4, label = "书籍",   unit = "本" },
@@ -73,13 +84,14 @@ end
 
 loadPins()
 
--- Pushpin badge, cached per size
-local pin_icons = {}
-local function getPinIcon(size)
+-- Badge icons (pushpin / shortcut), cached per name and size
+local badge_icons = {}
+local function getBadgeIcon(name, size)
     if size <= 0 then return end
-    local icon = pin_icons[size]
+    badge_icons[name] = badge_icons[name] or {}
+    local icon = badge_icons[name][size]
     if icon == nil then
-        local icon_file = plugin_dir .. "/pushpin.svg"
+        local icon_file = plugin_dir .. "/" .. name .. ".svg"
         if lfs.attributes(icon_file, "mode") == "file" then
             icon = ImageWidget:new{
                 file = icon_file,
@@ -88,23 +100,57 @@ local function getPinIcon(size)
                 alpha = true,
             }
         else
-            logger.warn("stickabookontop: pushpin.svg not found in", plugin_dir)
+            logger.warn("stickabookontop:", name .. ".svg not found in", plugin_dir)
             icon = false
         end
-        pin_icons[size] = icon
+        badge_icons[name][size] = icon
     end
     return icon or nil
 end
 
+-- Build a synthetic file-browser item for a pinned file that physically lives
+-- elsewhere, so it can be shown as a shortcut in the HOME folder. The item
+-- points at the real path, so it renders the real cover/name and opens the
+-- real file; it is flagged is_shortcut for badge drawing.
+local function buildShortcutItem(self, realpath, collate)
+    local attributes = lfs.attributes(realpath)
+    if not attributes or attributes.mode ~= "file" then return nil end
+    local parent, filename = util.splitFilePathName(realpath)
+    local item = self:getListItem(parent, filename, realpath, attributes, collate)
+    item.is_shortcut = true
+    return item
+end
+
 -- Move pinned entries to the top of the file browser listing:
--- "../" first, then pinned folders, then pinned books, then everything else
--- in its usual order.
+-- "../" first, then pinned folders, then pinned books, then HOME shortcuts to
+-- pinned books that live elsewhere, then everything else in its usual order.
 local orig_genItemTableFromPath = FileChooser.genItemTableFromPath
 FileChooser.genItemTableFromPath = function(self, path)
     local item_table = orig_genItemTableFromPath(self, path)
-    if self.name ~= "filemanager" or (#pins.files == 0 and #pins.folders == 0) then
+    if self.name ~= "filemanager" then
         return item_table
     end
+
+    -- Build HOME shortcuts for pinned books that are not already in HOME
+    local shortcuts = {}
+    local home = ffiUtil.realpath(filemanagerutil.getHomeFolder())
+    if home and ffiUtil.realpath(path) == home and not FileChooser.show_flat_view then
+        local collate = self:getCollate()
+        for _, realpath in ipairs(pins.files) do
+            local parent = ffiUtil.realpath((util.splitFilePathName(realpath)))
+            if parent ~= home then -- already shown as a real entry when in HOME
+                local item = buildShortcutItem(self, realpath, collate)
+                if item then
+                    table.insert(shortcuts, item)
+                end
+            end
+        end
+    end
+
+    if #pins.files == 0 and #pins.folders == 0 and #shortcuts == 0 then
+        return item_table
+    end
+
     local rank = {}
     for i, p in ipairs(pins.folders) do rank[p] = i end
     for i, p in ipairs(pins.files) do rank[p] = #pins.folders + i end
@@ -118,19 +164,24 @@ FileChooser.genItemTableFromPath = function(self, path)
             table.insert(rest, item)
         end
     end
-    if #pinned == 0 then
+    if #pinned == 0 and #shortcuts == 0 then
         return item_table
     end
     table.sort(pinned, function(a, b) return rank[a.path] < rank[b.path] end)
+
     if not self.display_mode_type then
-        -- classic display mode: covers are not drawn, so mark pinned entries
-        -- with a pushpin glyph before the name instead
+        -- classic display mode: covers are not drawn, so mark entries with a
+        -- glyph before the name instead of a corner badge
         for _, item in ipairs(pinned) do
             item.text = PIN_GLYPH .. " " .. item.text
         end
+        for _, item in ipairs(shortcuts) do
+            item.text = SHORTCUT_GLYPH .. " " .. item.text
+        end
     end
+
     local reordered = {}
-    for _, group in ipairs({ head, pinned, rest }) do
+    for _, group in ipairs({ head, pinned, shortcuts, rest }) do
         for __, item in ipairs(group) do
             reordered[#reordered + 1] = item
         end
@@ -138,39 +189,44 @@ FileChooser.genItemTableFromPath = function(self, path)
     return reordered
 end
 
--- Draw the pushpin badge on the top-left corner of pinned entries in
--- CoverBrowser's mosaic and list display modes.
+-- Draw a corner badge on pinned entries (pushpin, top-left) and on HOME
+-- shortcuts (open-in-new, top-right) in CoverBrowser's mosaic/list modes.
 local orig_paintTo = FileChooser.paintTo
 FileChooser.paintTo = function(self, bb, x, y)
     orig_paintTo(self, bb, x, y)
     local mode = self.display_mode_type
-    if self.name ~= "filemanager" or not mode or not next(pins_lookup) then
+    if self.name ~= "filemanager" or not mode then
         return
     end
-    local function paintBadge(w)
-        local badge_x, badge_y = w.dimen.x, w.dimen.y
+    local function paintBadge(w, icon_name, corner)
+        -- anchor rectangle: the cover frame in mosaic, the whole row in list
+        local ax, ay, aw = w.dimen.x, w.dimen.y, w.dimen.w
         local size
         if mode == "mosaic" then
             size = math.floor(math.min(w.dimen.w, w.dimen.h) / 7)
-            -- anchor to the cover frame, centered inside the grid cell
             local target = w[1] and w[1][1] and w[1][1][1]
             if target and target.dimen and target.dimen.w > 0 then
-                badge_x, badge_y = target.dimen.x, target.dimen.y
+                ax, ay, aw = target.dimen.x, target.dimen.y, target.dimen.w
             end
         else -- "list": the cover thumbnail sits at the left edge of the row
             size = math.floor(w.dimen.h / 6)
         end
-        local icon = getPinIcon(size)
+        local badge_x = corner == "right" and (ax + aw - size) or ax
+        local icon = getBadgeIcon(icon_name, size)
         if icon then
-            icon:paintTo(bb, badge_x, badge_y)
+            icon:paintTo(bb, badge_x, ay)
         end
     end
     local function walk(container)
         for i = 1, #container do
             local w = container[i]
             if w.entry then -- a menu item widget
-                if w.entry.path and pins_lookup[w.entry.path] and w.dimen and w.dimen.w > 0 then
-                    paintBadge(w)
+                if w.dimen and w.dimen.w > 0 and w.entry.path then
+                    if w.entry.is_shortcut then
+                        paintBadge(w, "shortcut", "right")
+                    elseif pins_lookup[w.entry.path] then
+                        paintBadge(w, "pushpin", "left")
+                    end
                 end
             elseif #w > 0 then -- a layout container, e.g. a mosaic row
                 walk(w)
